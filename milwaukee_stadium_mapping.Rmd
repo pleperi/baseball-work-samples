@@ -12,11 +12,8 @@ library(tigris)
 library(sf)
 library(crsuggest)
 library(mapboxapi)
-library(leaflet)
 library(tidyverse)
 library(tidycensus)
-library(janitor)
-library(scales)
 library(spdep)
 options(tigris_use_cache = TRUE)
 theme_set(theme_bw())
@@ -30,6 +27,7 @@ stadium_url <- "https://services1.arcgis.com/Hp6G80Pky0om7QvQ/arcgis/rest/servic
 stadium <- st_read(stadium_url) %>%
   filter(str_detect(str_to_upper(NAME), "MILLER PARK"))
 ```
+
 Once the data is loaded, a recommendation is needed for the best CRS to use. 
 All layers of the maps created in subsequent steps will be transformed
 to the same CRS.
@@ -37,6 +35,7 @@ to the same CRS.
 ```{r}
 suggest_crs(stadium)
 ```
+
 I'll use 8159, which measures distance in meters.
 
 ```{r}
@@ -54,6 +53,7 @@ wi_tracts <- tracts("WI", cb = TRUE, year = 2021) %>%
   st_filter(stadium_t, .predicate = st_is_within_distance, dist = 50000) %>%
   erase_water()
 ```
+
 The final layer in my first visualization will show the area within a 30-minute
 drive of the stadium. 
 
