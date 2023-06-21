@@ -1,0 +1,287 @@
+---
+title: "A Model to Predict Mike Trout's Whiffs"
+output: html_notebook
+---
+
+There's been some buzz among MLB analysts lately about Mike Trout's (relatively) slow start to the 2023 season. A look at his Baseball Savant page reveals that one of the big things that's changed in the past couple years is that he's swinging and missing more than before. So I decided to build a model to see how well I could predict which pitches he whiffs on.
+
+I downloaded my dataset from Statcast Search. It includes every swing Trout has taken since 2015 (through June 18 of this season). I chose that as my start date because that was the first year Statcast data became available, providing a variety of data points for each pitch's trajectory. I left out bunts (and bunt attempts) and pitchouts. Balls in play and fouls were labeled contact; swinging strikes and foul tips were labeled a whiff. The data can be downloaded [here](https://baseballsavant.mlb.com/statcast_search?hfPTM=&hfPT=&hfAB=&hfGT=R%7C&hfPR=foul%7Chit%5C.%5C.into%5C.%5C.play%7Cfoul%5C.%5C.tip%7Cswinging%5C.%5C.strike%7Cswinging%5C.%5C.strike%5C.%5C.blocked%7C&hfZ=&hfStadium=&hfBBL=&hfNewZones=&hfPull=&hfC=&hfSea=2023%7C2022%7C2021%7C2020%7C2019%7C2018%7C2017%7C2016%7C2015%7C&hfSit=&player_type=batter&hfOuts=&hfOpponent=&pitcher_throws=&batter_stands=&hfSA=&game_date_gt=&game_date_lt=2023-06-18&hfMo=&hfTeam=&home_road=&hfRO=&position=&hfInfield=&hfOutfield=&hfInn=&hfBBT=&batters_lookup%5B%5D=545361&hfFlag=&metric_1=&group_by=name-event&min_pitches=0&min_results=0&min_pas=0&sort_col=pitches&player_event_sort=api_p_release_speed&sort_order=desc&chk_event_release_speed=on#results).
+
+```{r setup, echo = FALSE, message = FALSE}
+require(tidyverse)
+require(tidymodels)
+require(doParallel)
+require(mltools)
+require(xgboost)
+require(kknn)
+require(nnet)
+require(stacks)
+theme_set(theme_bw())
+```
+
+```{r}
+whiff <- c('swinging_strike', 'swinging_strike_blocked', 'foul_tip')
+
+mt_swings <- readr::read_csv("./mt_swings.csv") %>%
+  mutate(cw = if_else(description %in% whiff, "Whiff", "Contact"),
+         target_bin = if_else(description %in% whiff, 1, 0))
+```
+Here's Trout's overall whiff rate:
+```{r}
+mean(mt_swings$target_bin)
+```
+So predicting that Trout makes contact on every pitch would already achieve an accuracy of almost 78%. 
+
+First, some EDA. As I outline on my [blog](https://swingtakebaseballblog.wordpress.com/2023/06/20/whats-going-on-with-mike-trout/), pitch location has a visible impact on Trout's whiff rate. Graphing whiff rate by plate_z, the height of the pitch as it crosses home plate, confirms what Baseball Savant's Illustrator tool shows.
+```{r plot}
+mt_swings %>%
+  filter(!is.na(plate_z)) %>%
+  group_by(round(plate_z, 1)) %>%
+  filter(n() >= 10) %>%
+  summarize(whiff_rate = mean(target_bin, na.rm = TRUE),
+            n = n()) %>%
+  ggplot(aes(`round(plate_z, 1)`, whiff_rate)) +
+  geom_line(aes(group = 1)) +
+  geom_point(aes(size = n), color = "blue") +
+  theme(legend.position = "none") +
+  labs(x = "Pitch Height (feet)", y = "Whiff Rate") +
+  scale_y_continuous(labels = scales::percent)
+```
+I'll start the modeling process with some setup: among other things, setting a seed so the code is reproducible; creating training data to build the model and test data to evaluate it; splitting the test data into folds for cross-validation; and determining the metrics used to select hyperparameters. Accuracy won't work well in this case because the classes are imbalanced - Trout makes contact much more often than not. So I'll keep an eye on it, but I'll really be looking to optimize the area under the ROC curve, which provides better information on how well the model is distinguishing between classes.
+```{r}
+set.seed(2023)
+
+spl <- rsample::initial_split(mt_swings, prop = .7)
+train <- training(spl)
+test <- testing(spl)
+
+train_fold <- train %>%
+  rsample::vfold_cv(v = 5)
+
+doParallel::registerDoParallel(cores = 3)
+
+mset <- metric_set(roc_auc, accuracy)
+
+grid_control <- control_grid(save_pred = TRUE,
+                             save_workflow = TRUE,
+                             extract = extract_model)
+```
+I'll first create a base recipe for data preprocessing that's common to all models I will build. The models will include a number of variables related to the pitch's trajectory and contextual variables: balls, strikes, outs, inning, and season. My expectation is that the pitch's location and movement will be more important than context, but those variables might still contain valuable information. Inning is a proxy for fatigue; balls and strikes are an important dynamic in any pitcher-batter matchup. (For example, in an 0-2 count, the pitcher can try to get the batter to chase a pitch outside the zone; the batter, in turn, needs to defend the strike zone and may swing at a pitch he'd take in another context.)
+```{r}
+base_rec <- recipe(cw ~ plate_x + plate_z + release_pos_x + release_pos_z +
+                     pfx_x + pfx_z + 
+                     p_throws + effective_speed + release_speed + release_extension +
+                     release_spin_rate + vx0 + vy0 + vz0 + ax + ay + az +
+                     balls + strikes + outs_when_up + inning + inning_topbot +
+                     game_year,
+                   data = test) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_bag(all_numeric_predictors()) 
+```
+
+### Model 1: Gradient Boosting
+
+I'll start with a gradient boosting model. This is a machine learning method that builds a series of decision trees, where each tree tries to correct the errors of the previous one by weighing misclassified observations more heavily.
+
+Since xgboost takes input features as a matrix, I'll need additional preprocessing to convert the two text variables in my model to binary flags. Gradient boosting models contain a number of hyperparameters that can be optimized. To begin, I'll choose a high learning rate and determine the optimal number of trees.
+```{r}
+xg_rec <- base_rec %>%
+  step_dummy(p_throws, inning_topbot)
+
+xg_wf <- workflow() %>%
+  add_recipe(xg_rec) %>%
+  add_model(boost_tree("classification",
+                       trees = tune(),
+                       learn_rate = .1,
+                       tree_depth = 6,
+                       min_n = 15,
+                       mtry = 12) %>% 
+              set_engine("xgboost"))
+
+xg_tune <- xg_wf %>%
+  tune_grid(train_fold,
+            grid = crossing(trees = seq(50, 250, 10)),
+            metrics = mset,
+            control = grid_control)
+```
+```{r}
+autoplot(xg_tune)
+```
+Both metrics agree that 60 trees is optimal at this learning rate.
+
+For brevity, I omit the next few steps: first, tuning the tree depth and minimum number of observations per node; then, tuning the number of predictors (mtry) and the proportion of observations sampled (sample_size). After quite a bit of tinkering, I got to this final step: lowering the learning rate and optimizing the number of trees again. 
+```{r}
+xg_wf <- workflow() %>%
+  add_recipe(xg_rec) %>%
+  add_model(boost_tree("classification",
+                       trees = tune(),
+                       learn_rate = tune(),
+                       tree_depth = 8,
+                       min_n = 10,
+                       mtry = 15,
+                       sample_size = 0.9) %>% 
+              set_engine("xgboost"))
+
+xg_tune <- xg_wf %>%
+  tune_grid(train_fold,
+            grid = crossing(learn_rate = c(.1, .05, .01),
+                            trees = seq(100, 600, 100)),
+            metrics = mset,
+            control = grid_control)
+```
+```{r}
+autoplot(xg_tune)
+```
+The ROC peaks with a learning rate of 0.01 and 400 trees. I'll do a closer search of that region.
+```{r}
+xg_tune <- xg_wf %>%
+  tune_grid(train_fold,
+            grid = crossing(learn_rate = c(.02, .01, .005),
+                            trees = seq(300, 500, 50)),
+            metrics = mset,
+            control = grid_control)
+```
+```{r}
+autoplot(xg_tune)
+```
+From here, I'll fix the optimal hyperparameters and fit a model on the full training set. The xgboost library provides a function to determine the most important variables, a helpful glimpse into a black-box model.
+```{r}
+xg_wf_best <- xg_wf %>%
+  finalize_workflow(select_best(xg_tune, metric = "roc_auc"))
+
+xg_fit_best <- xg_wf_best %>%
+  fit(train)
+
+xg_importances <- xgboost::xgb.importance(model = xg_fit_best$fit$fit$fit)
+```
+```{r}
+xg_importances %>%
+  mutate(Feature = fct_reorder(Feature, Gain)) %>%
+  ggplot(aes(Gain, Feature)) +
+  geom_point()
+```
+Pitch height really is the most important variable.
+
+### Model 2: K Nearest Neighbors
+
+The second model I'll build, k nearest neighbors (KNN), does exactly what it sounds like. It uses the points closest to a given observation to determine its class. The number of neighboring points, and their weight, are hyperparameters that can be tuned.
+
+KNN can perform poorly on high-dimensional data, so I'll use principal components analysis (PCA) to reduce the number of features. Specifically, I'll derive principal components from the pitch trajectory data but leave the contextual variables alone. PCA requires inputs to be centered and scaled, and I'll center and scale the components themselves after they are derived. Since this algorithm doesn't deal well with binary variables, I'll need to decide what to do with the two categorical features. I'll split pitches into two groups based on whether the pitcher is a righty or lefty; it's known that right-handed pitchers have an advantage over right-handed batters. I'll remove the flag for top/bottom of the inning; there's no intuitive reason why Trout would whiff more in home games than away games, or vice versa. The number of features extracted via principal components can also be tuned (either with the number or the percentage of variance explained), but for the sake of brevity I omit the tinkering I did on this hyperparameter.
+```{r}
+knn_rec <- base_rec %>%
+  update_role(p_throws, new_role = "splitting variable") %>%
+  remove_role(inning_topbot, old_role = "predictor") %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_pca(contains("_x"), contains("_z"), contains("release"),
+           effective_speed, vx0, vy0, vz0, ax, ay, az, 
+           threshold = tune()) %>%
+  step_normalize(all_numeric_predictors())
+
+knn_wf <- workflow() %>%
+  add_recipe(knn_rec) %>%
+  add_model(nearest_neighbor("classification",
+                             neighbors = tune(), 
+                             weight_func = tune()) %>% 
+              set_engine("kknn"))
+
+knn_tune <- knn_wf %>%
+  tune_grid(train_fold,
+            grid = crossing(threshold = .85,
+                            neighbors = seq(5, 205, 20),
+                            weight_func = c("rectangular", "cos", "gaussian", "rank")),
+            metrics = mset,
+            control = grid_control)
+```
+```{r}
+autoplot(knn_tune)
+```
+
+### First Blended Model
+
+The stacks library takes in candidate models and finds the optimal blend. I'll create a combination of the gradient boosting and KNN models.
+```{r}
+xg_best <- xg_tune %>% 
+  filter_parameters(parameters = select_best(xg_tune, metric = "roc_auc"))
+knn_best <- knn_tune %>% 
+  filter_parameters(parameters = select_best(knn_tune, metric = "roc_auc"))
+
+blend <- stacks() %>%
+  add_candidates(xg_best) %>%
+  add_candidates(knn_best) %>%
+  blend_predictions()
+
+xg_knn_fit <- blend %>%
+  fit_members()
+```
+How well does the model do? Let's find out using the test data.
+```{r}
+predictions <- xg_knn_fit %>%
+  predict(test, type = "class", members = TRUE)
+```
+```{r}
+table(predictions$.pred_class, test$cw)
+```
+Not too impressive - less than 28% of whiffs are being correctly identified. Let's check the overall accuracy.
+```{r}
+sum(diag(table(predictions$.pred_class, test$cw)))/sum(table(predictions$.pred_class, test$cw))
+```
+By outputting class probabilities rather than the predicted classes, I can look at AUC for each model individually.
+```{r}
+predictions2 <- xg_knn_fit %>%
+  predict(test, type = "prob", members = TRUE)
+```
+```{r}
+cat(mltools::auc_roc(predictions2$.pred_Whiff, test$target_bin),
+    mltools::auc_roc(predictions2$.pred_Whiff_xg_best_1_08, test$target_bin),
+    mltools::auc_roc(predictions2$.pred_Whiff_knn_best_1_21, test$target_bin))
+```
+The blended model is just a hair better than the gradient boosting model alone.
+
+### Model 3: Neural Net
+
+I'll train one final model: a neural network. The nnet engine allows tuning of three hyperparameters. I omit my tuning of the number of hidden units as well as an initial search of a wider range of epochs.
+```{r}
+nnet_rec <- xg_rec %>%
+  step_normalize(all_numeric_predictors())
+
+nnet_wf <- workflow() %>%
+  add_recipe(nnet_rec) %>%
+  add_model(mlp("classification",
+                hidden_units = 4,
+                epochs = tune(),
+                penalty = tune()) %>% 
+              set_engine("nnet"))
+
+nnet_tune <- nnet_wf %>%
+  tune_grid(train_fold,
+            grid = crossing(epochs = seq(400, 450, 10),
+                            penalty = c(.01, .05, .1)),
+            metrics = mset,
+            control = grid_control)
+```
+```{r}
+autoplot(nnet_tune)
+```
+Finally, I'll add this model to my stack and see if it makes the final model any better.
+```{r}
+nnet_best <- nnet_tune %>% 
+  filter_parameters(parameters = select_best(nnet_tune, metric = "roc_auc"))
+
+blend2 <- stacks() %>%
+  add_candidates(xg_best) %>%
+  add_candidates(knn_best) %>%
+  add_candidates(nnet_best) %>%
+  blend_predictions()
+
+xg_knn_nnet_fit <- blend2 %>%
+  fit_members()
+
+predictions_final <- xg_knn_nnet_fit %>%
+  predict(test, type = "prob", members = TRUE)
+```
+```{r}
+mltools::auc_roc(predictions_final$.pred_Whiff, test$target_bin)
+```
+Another incremental improvement!
+
+There are many, many directions to go from here. Additional features can be incorporated, both physical (like vertical approach angle) and contextual (like replacing inning with time through the order, or adding a flag for day game/night game). Pretty soon, Hawkeye data tracking swing paths might become available. Individual models can be refined; additional algorithms, like a random forest, can be used and added to the stack. And then there's the question of interpretability. PD plots can help determine the impact of specific features, holding all others constant. 
