@@ -1,0 +1,281 @@
+---
+title: "Breakout Hitters of 2023"
+output: html_notebook
+---
+
+Now that we're approaching the halfway point of the 2023 season, I want to look at the biggest breakouts of 2023 by weighted on-base average (wOBA). A common concept in baseball analysis is regression to the mean. Players with a shorter track record are expected to regress more. I will quantify this using an empirical Bayes method. Specifically, wOBA is a multinomial distribution, so I will fit a Dirichlet distribution that represents my prior and update it with each hitter's actual performance.
+
+For players with multiple MLB seasons, I want to factor in their track record but weigh their most recent results more heavily. To get a sense of how much to "discount" previous years, I will fit a simple linear model predicting wOBA for a given season based on the seasons immediately before it. Then I'll proceed with fitting the Dirichlet.
+```{r setup, echo = FALSE, message = FALSE}
+require(tidyverse)
+require(sirt)
+theme_set(theme_bw())
+```
+
+### Part 1: Linear Model
+
+My data for this section comes from the batting leaderboard on Fangraphs. I chose 1999 as my starting year - one year after the latest expansion. I'll limit my linear model to player seasons with at least 100 plate appearances. I'll also use data prior to 2020, for two reasons. One is to avoid having to project what the 60-game season would have looked like if it lasted the normal 162 games. The second is that when I ultimately fit my Dirichlet prior, I'll be using more recent seasons, and it would create a bias to use them to determine their own relative weights.
+
+This preprocessing code creates lagged variables so that each row will contain that player's wOBA for previous seasons. It also creates weights: I will weigh each player in the linear model using the geometric mean of plate appearances for the seasons I'm considering.
+```{r, echo = FALSE}
+woba_raw <- readr::read_csv("./fg_woba_1999_2023.csv") 
+```
+```{r}
+woba <- woba_raw %>%
+  select(playerid, Name, Season, wOBA, PA) %>%
+  filter(PA >= 100 & Season < 2020) %>%
+  group_by(playerid, Name) %>%
+  mutate(Season1 = lag(Season, order_by = Season),
+         Season2 = lag(Season, 2, order_by = Season),
+         Season3 = lag(Season, 3, order_by = Season),
+         Season4 = lag(Season, 4, order_by = Season),
+         Season5 = lag(Season, 5, order_by = Season),
+         wOBA1 = lag(wOBA, order_by = Season),
+         wOBA2 = lag(wOBA, 2, order_by = Season),
+         wOBA3 = lag(wOBA, 3, order_by = Season),
+         wOBA4 = lag(wOBA, 4, order_by = Season),
+         wOBA5 = lag(wOBA, 5, order_by = Season),
+         PA1 = lag(PA, order_by = Season),
+         PA2 = lag(PA, 2, order_by = Season),
+         PA3 = lag(PA, 3, order_by = Season),
+         PA4 = lag(PA, 4, order_by = Season),
+         PA5 = lag(PA, 5, order_by = Season),
+         wt1 = exp((log(PA) + log(PA1))/2),
+         wt2 = exp((log(PA) + log(PA1) + log(PA2))/3),
+         wt3 = exp((log(PA) + log(PA1) + log(PA2) + log(PA3))/4),
+         wt4 = exp((log(PA) + log(PA1) + log(PA2) + log(PA3) + log(PA4))/5),
+         wt5 = exp((log(PA) + log(PA1) + log(PA2) + log(PA3) + log(PA4) + log(PA5))/6))
+```
+Part of the question I want to answer is how many prior seasons are actually informative when it comes to the current season's performance. Do I want to include two years of data? Ten years? Something in between?
+
+I'll first compare a linear model with only one prior season to a linear model with two seasons' worth of history. I'll use the same sample of players in both to make it a fair comparison i.e. players with two or more consecutive prior seasons.
+```{r}
+yr1 <- lm(wOBA ~ wOBA1,
+          data = woba %>% 
+            filter(!is.na(Season2) &
+                     Season == Season1 + 1 &
+                     Season1 == Season2 + 1),
+          weights = wt1)
+yr2 <- lm(wOBA ~ wOBA1 + wOBA2,
+          data = woba %>% 
+            filter(!is.na(Season2) &
+                     Season == Season1 + 1 &
+                     Season1 == Season2 + 1),
+          weights = wt2)
+anova(yr1, yr2)
+```
+The second model is significantly better than the first, so it's informative to include the second year history. What about the third year?
+```{r}
+yr2 <- lm(wOBA ~ wOBA1 + wOBA2,
+          data = woba %>% 
+            filter(!is.na(Season3) &
+                     Season == Season1 + 1 &
+                     Season1 == Season2 + 1 &
+                     Season2 == Season3 + 1),
+          weights = wt2)
+yr3 <- lm(wOBA ~ wOBA1 + wOBA2 + wOBA3,
+          data = woba %>% 
+            filter(!is.na(Season3) &
+                     Season == Season1 + 1 &
+                     Season1 == Season2 + 1 &
+                     Season2 == Season3 + 1),
+          weights = wt3)
+anova(yr2, yr3)
+```
+The third year is also valuable. What about the fourth?
+```{r}
+yr3 <- lm(wOBA ~ wOBA1 + wOBA2 + wOBA3,
+          data = woba %>% 
+            filter(!is.na(Season4) &
+                     Season == Season1 + 1 &
+                     Season1 == Season2 + 1 &
+                     Season2 == Season3 + 1 &
+                     Season3 == Season4 + 1),
+          weights = wt3)
+yr4 <- lm(wOBA ~ wOBA1 + wOBA2 + wOBA3 + wOBA4,
+          data = woba %>% 
+            filter(!is.na(Season4) &
+                     Season == Season1 + 1 &
+                     Season1 == Season2 + 1 &
+                     Season2 == Season3 + 1 &
+                     Season3 == Season4 + 1),
+          weights = wt4)
+anova(yr3, yr4)
+```
+Still significant, although the F-statistic is lower now. Here's five years:
+```{r}
+yr4 <- lm(wOBA ~ wOBA1 + wOBA2 + wOBA3 + wOBA4,
+          data = woba %>% 
+            filter(!is.na(Season5) &
+                     Season == Season1 + 1 &
+                     Season1 == Season2 + 1 &
+                     Season2 == Season3 + 1 &
+                     Season3 == Season4 + 1 &
+                     Season4 == Season5 + 1),
+          weights = wt4)
+yr5 <- lm(wOBA ~ wOBA1 + wOBA2 + wOBA3 + wOBA4 + wOBA5,
+          data = woba %>% 
+            filter(!is.na(Season5) &
+                     Season == Season1 + 1 &
+                     Season1 == Season2 + 1 &
+                     Season2 == Season3 + 1 &
+                     Season3 == Season4 + 1 &
+                     Season4 == Season5 + 1),
+          weights = wt5)
+anova(yr4, yr5)
+```
+The fifth year isn't adding predictive power anymore. So I'll fit my prior on four years of data. Here are the model coefficients:
+```{r}
+summary(yr4)
+```
+The coefficient for the two-year lag is a little more than half the coefficient for the one-year lag, and the coefficients for the three- and four-year lags are a little over a third. So to estimate the prior I'll use for 2023 projections, I'll calculate each player's input values as follows: their totals from 2022, plus half their totals from 2021, plus one-third of their totals from 2020 and 2019.
+
+### Part 2: Estimating the Dirichlet prior
+
+The data for this section also comes from Fangraphs, but instead of using the Advanced stats, I'll use the Standard stats that provide the necessary count data. I'll need the number of singles, doubles, triples, home runs, unintentional walks, hit by pitch, and other events (essentially, outs). The denominator of wOBA is at-bats plus (unintentional) walks plus hit by pitch plus sacrifice flies, so I can calculate the other events as at-bats minus hits plus sacrifice flies. (For more on wOBA, see [this explanation](https://library.fangraphs.com/offense/woba/).)
+
+I'll apply a few exclusions for the players I use to fit the prior: they were active in 2022, and the sum of their weighted wOBA events represent at least one qualified season (502 PA).
+```{r, echo = FALSE}
+dir_data <- readr::read_csv("./fg_hitters_1999_2023.csv") 
+```
+```{r, message = FALSE}
+dir_prior <- dir_data %>%
+  filter(Season >= 2019 & Season <= 2022 & (AB + BB - IBB + HBP + SF) > 0) %>%
+  group_by(playerid) %>%
+  filter(max(Season) == 2022) %>%
+  ungroup() %>%
+  mutate(uBB = BB - IBB,
+         other = AB - H + SF) %>%
+  select(playerid,
+         Name,
+         Season,
+         `1B`,
+         `2B`,
+         `3B`,
+         HR,
+         uBB,
+         HBP,
+         other) %>%
+  pivot_longer(cols = -c(playerid, Name, Season),
+               names_to = "Event",
+               values_to = "n") %>%
+  mutate(wt_n = if_else(Season == 2022,
+                            n,
+                            if_else(Season == 2021,
+                                    n/2,
+                                    n/3))) %>%
+  group_by(playerid, Name, Event) %>%
+  summarize(wt_total = sum(wt_n)) %>%
+  group_by(playerid) %>%
+  filter(sum(wt_total) >= 502) %>%
+  ungroup() %>%
+  pivot_wider(names_from = Event,
+              values_from = wt_total)
+```
+That leaves a sample of 279 players. Time to fit the prior!
+```{r}
+(prior_dist <- sirt::dirichlet.mle(dir_prior[,3:9]))
+```
+The bottom row provides estimates of the rates when each type of event is expected to occur. On average, we expect a single 14.4% of the time and a home run 3.2% of the time.
+
+The second row is the effective sample size of this prior. So, when regressing players' stats to the mean we will add the equivalent of 184.7 weighted PA of average performance.
+
+What can we infer from this prior about the expected distribution of outcomes? We can see this by drawing samples. I'll use the wOBA constants for 2023, again courtesy of Fangraphs.
+```{r, message = FALSE}
+woba_constants <- matrix(c(.886, 1.252, 1.581, .728, 2.024, 0, .697),
+                         ncol = 1)
+
+data.frame(wOBA = dirichlet.simul(matrix(prior_dist$alpha, nrow = 1000, ncol = length(prior_dist$alpha), byrow = TRUE)) %*% woba_constants) %>%
+  ggplot(aes(wOBA)) +
+  geom_density()
+```
+It's really wide! And that's a feature, not a bug. Baseball is random. League-wide wOBA for the 2023 season so far (as of June 21) is .318, which is about right. But in this distribution, a wOBA above .400 happens about 4% of the time through randomness alone.
+```{r}
+mean(dirichlet.simul(matrix(prior_dist$alpha, nrow = 1000, ncol = length(prior_dist$alpha), byrow = TRUE)) %*% woba_constants >= .4)
+```
+
+### Part 3: Priors and Percentiles
+
+OK! Let's get a list of players with at least 200 plate appearances so far in 2023 along with their wOBA. Then I'll calculate the parameters for each player's posterior wOBA distribution.
+
+```{r, message = FALSE}
+players_2023 <- woba_raw %>%
+  filter(Season == 2023 & PA >= 200) %>%
+  select(playerid, Name, wOBA, PA)
+
+dir_post <- dir_data %>%
+  filter(Season >= 2019 & Season <= 2022 & playerid %in% players_2023$playerid) %>%
+  mutate(uBB = BB - IBB,
+         other = AB - H + SF) %>%
+  select(playerid,
+         Name,
+         Season,
+         `1B`,
+         `2B`,
+         `3B`,
+         HR,
+         uBB,
+         HBP,
+         other) %>%
+  right_join(players_2023 %>% select(playerid, Name), # to add in the rookies
+             by = c("playerid", "Name")) %>%
+  mutate(across(where(is.numeric), ~replace_na(., 0))) %>%
+  pivot_longer(cols = -c(playerid, Name, Season),
+               names_to = "Event",
+               values_to = "n") %>%
+  mutate(wt_n = if_else(Season == 2022,
+                            n,
+                            if_else(Season == 2021,
+                                    n/2,
+                                    n/3))) %>%
+  group_by(playerid, Name, Event) %>%
+  summarize(wt_total = sum(wt_n)) %>%
+  ungroup() %>%
+  left_join(data.frame(Event = names(prior_dist$alpha),
+                       wt_prior = prior_dist$alpha),
+            by = "Event") %>%
+  mutate(wt_post = wt_total + wt_prior) %>%
+  select(-c(wt_total, wt_prior)) %>%
+  pivot_wider(names_from = Event,
+              values_from = wt_post) %>%
+  right_join(players_2023,
+             by = c("playerid", "Name"))
+```
+The final step is to draw samples from each player's posterior distribution and figure out the percentile of his actual wOBA. 
+```{r}
+projected_woba <- rep(0, nrow(dir_post))
+for (i in 1:nrow(dir_post)) {
+  projected_woba[i] <- matrix(unlist(dir_post[i, 3:9])/sum(unlist(dir_post[i, 3:9])), nrow = 1) %*% woba_constants
+}
+
+set.seed(2023)
+get_percentile <- function(params, constants, actual_woba, trials = 1000) {
+  mean(dirichlet.simul(matrix(params, nrow = trials, ncol = length(params), byrow = TRUE)) %*% constants <= actual_woba)
+}
+
+percentiles <- rep(0, nrow(dir_post))
+for (i in 1:nrow(dir_post)) {
+  percentiles[i] <- get_percentile(unlist(dir_post[i, 3:9]), 
+                                   woba_constants, 
+                                   as.double(dir_post[i, 10]))
+}
+
+breakout_hitters_ds <- bind_cols(dir_post %>%
+                                   select(Name, wOBA, PA),
+                                 projected = projected_woba,
+                                 percentile = percentiles)
+```
+Drumroll, please...let's see the winners.
+```{r}
+breakout_hitters_ds %>%
+  arrange(desc(percentile)) %>%
+  slice(1:10)
+```
+One of the big winners is Orlando Arcia! He barely made it to the 200-PA cutoff, but he's having a season way better than his career norm. His career wOBA is a below-average .294! He's currently overperforming his xwOBA by almost 50 points, though, so he's benefitting from a lot of luck. Shohei Ohtani is a particularly interesting entry on this list - as good as he's been in the past, this season is still unexpected. And he's actually slightly overperforming his xwOBA. Let's look at the range of wOBA that would be expected based on his career prior to 2023:
+```{r}
+so <- dir_post %>% filter(Name == "Shohei Ohtani")
+data.frame(wOBA = dirichlet.simul(matrix(unlist(so[3:9]), nrow = 1000, ncol = length(unlist(so[3:9])), byrow = TRUE)) %*% woba_constants) %>%
+  ggplot(aes(wOBA)) +
+  geom_density()
+```
+It'll be interesting to see which of these players can sustain their breakout in the second half of the season!
